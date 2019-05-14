@@ -14,6 +14,8 @@ library(tidyr)
 library(dplyr)
 library(foreach)
 library(doParallel)
+library(qqman)
+library(rsnps)
 
 dir <- "/panfs/roc/groups/15/petersla/diler001/Genetics/"
 #dir <- "C:/Users/Owner/Google Drive/Genetics_Research/New/"
@@ -21,9 +23,7 @@ dir <- "/panfs/roc/groups/15/petersla/diler001/Genetics/"
 path <- dir
 
 setwd(dir)
-population <- "YRI"
-
-cleaned <- FALSE
+population <- "CEU"
 
 #####Initial downloading of data - only need to do this section once#####
 
@@ -67,14 +67,14 @@ remove(list = paste0(population, "_IC_data"))
 
 print(paste0("Number of cell lines: ", length(Cell_lines)))
 
-if(cleaned == FALSE) {
+if(file.exists(paste0(population, "Gen_Dat_Clean_check.csv")) == FALSE) {
   
   #####Cleaning new genotype data#####
   
   numRows <- nrow(fread(paste0(population, "_Gen_Dat_Check.csv"), select = 1)) + 1
   parts <- 1000
   chunkSize <- ceiling(numRows/parts)
-  lastSize <- chunkSize*parts - numRows
+  lastSize <- numRows - chunkSize*(parts-1)
   
   genColNames <- colnames(fread(paste0(population, "_Gen_Dat_Check.csv"), 
                                  header = T, nrows = 0))
@@ -125,10 +125,9 @@ if(cleaned == FALSE) {
               Gen_Dat != genotypes[16]] <- NA 
     
     Gen_Dat[, c(1:2)] <- temp
-    remove(temp)
     
     # Creating function for converting from string genotype to MAF
-    Converter <- function(column, key = Gen_Dat[, 2]) {
+    Converter <- function(column, key = temp[, 2]) {
       for(r in 1:length(column)) {
         if (!is.na(column[r])){
           # Converts from string genotype to MAF
@@ -150,19 +149,29 @@ if(cleaned == FALSE) {
     fwrite(Gen_Dat, file = paste0("Partitions/", population, "_Gen_Dat_Clean_Check", p, ".csv"))
     print(paste0(Sys.time(), ", Partition ", p, " complete"))
   }
-}
 
 # Reading in cleaned partitions and aggregating for analysis
 Gen_Dat <- rbindlist(lapply(X = str_subset(list.files("Partitions/"), pattern = population),
   FUN = function(x) {
-    return(dcast(melt(fread(paste0("Partitions/", x))[,ALLELES:=NULL], 
-                      id.vars = "SNP"), variable ~ SNP))
+    print(x); return(fread(paste0("Partitions/", x))[,ALLELES:=NULL])
     }))
 
-Gen_Dat <- dcast(melt(Gen_Dat[,ALLELES:=NULL], id.vars = "SNP"), variable ~ SNP)
-colnames(Gen_Dat)[1] <- "Cell_line"
+Cell_line <- colnames(Gen_Dat)[-c(1)]
+SNP <- Gen_Dat[, "SNP", with = F]
+
+# Transposing genotype values (long to wide format)
+Gen_Dat <- as.data.table(t(as.matrix(Gen_Dat[, SNP := NULL])))
+Gen_Dat <- Gen_Dat[, Cell_lines := Cell_line] 
+
+# Adding back in column names
+colnames(Gen_Dat) <- c(unlist(SNP), "Cell_line")
+
+# Rearranging columns
+Gen_Dat <- Gen_Dat[, c("Cell_line", unlist(SNP)), with = FALSE]
+remove(SNP)
 
 fwrite(Gen_Dat, file = paste0(population, "Gen_Dat_Clean_check.csv"))
+}
 
 #####Reading original phenotype data in#####
 
@@ -197,34 +206,34 @@ PhenData_Combined <- PhenData_Combined %>% mutate(Avg_IC20 = log(Avg_IC20), Avg_
   dplyr::select(-c(Mut0, Mut10, Mut20))
 
 #####Looping through doing analysis for each partition of data#####
-for(p in 1:20) {
-  #Loading new genotype data
-  Gen_Dat <- readRDS(paste0(population, "_Gen_Dat_Clean2.Rda"))
-  Gen_Dat <- setDT(Gen_Dat)
+
+numCols <- ncol(fread(paste0(population, "Gen_Dat_Clean_check.csv"), 
+                      nrows = 0))-1
+parts <- 100
+chunkSize <- floor(numCols/parts)
+
+startStop <- data.frame(starts = seq(2, numCols+1, by = chunkSize), 
+           stops = c(seq(1, numCols+1, by = chunkSize)[-c(1)], numCols))
+
+for(p in 1:nrow(startStop)) {
+  # Loading partition of cleaned genotype data
+  Gen_Dat <- fread(paste0(population, "Gen_Dat_Clean_check.csv"),
+                   select = c(1, startStop[p, 1]:startStop[p, 2]))
   
-  #Separating genotype data into 20 partitions
-  num_cols <- ncol(Gen_Dat); 
-  indices <- c(seq(1, num_cols, by = ceiling(num_cols/20)), num_cols)
-  indices[1] <- 0
-  Gen_Dat <- Gen_Dat[, (indices[p]+1):indices[p+1]] %>% as.data.frame()
-  
-  #Converting columns to numeric type
-  #Gen_Dat <- Gen_Dat[, (colnames(Gen_Dat)[-c(1)]) := lapply(.SD, as.numeric), .SDcols = colnames(Gen_Dat)[-c(1)]]
-  Gen_Dat[, -c(1)] <- sapply(Gen_Dat[, -c(1)], as.numeric)
-  
-  #Running mass univariate analysis for given genotype data subset
+  # Running mass univariate analysis for given genotype data subset
   detectCores()
-  ncores <- 10 #Set ncores to something less than or equal to available cores
+  ncores <- 15
   cl <- makeCluster(ncores) # creates a cluster with <ncore> cores
   registerDoParallel(cl) # register the cluster
   
-  results <- foreach(j = 4:ncol(PhenData_Combined)) %dopar% {
+  results <- foreach(j = 5:ncol(PhenData_Combined)) %dopar% {
     library(data.table)
     library(tidyverse)
-    #Creating function for fitting MLR model
+    
+    # Creating function for fitting MLR model
     MLR <- function(gendCol, snpCol, phenCol) {
-      temp <- data.frame(g = gendCol, s = snpCol)
-      if(temp[complete.cases(temp), c("g")] %>% unique() %>% length() > 1) {
+      temp <- data.frame(gender = gendCol, snp = snpCol, phen = phenCol)
+      if(temp[complete.cases(temp), c("gender")] %>% unique() %>% length() > 1) {
         fit <- lm(phenCol ~ gendCol + snpCol)
         if(dim(summary(fit)$coefficients)[1]>2) {
           tStat <- summary(fit)$coefficients[3,3]
@@ -234,7 +243,8 @@ for(p in 1:20) {
       } else{return(list(NA, NA))}
     }
     
-    tempResult <- lapply(FUN = MLR, X = as.data.frame(Gen_Dat)[, -c(1)], gendCol = PhenData_Combined$Gender, 
+    tempResult <- lapply(FUN = MLR, X = as.data.frame(Gen_Dat)[, -c(1)], 
+                         gendCol = PhenData_Combined$Gender, 
                          phenCol = PhenData_Combined[, j])
     out <- list(tempResult, colnames(PhenData_Combined)[j], Sys.time())
     names(out) <- c("tVal_pVal", "phenotype", "time")
@@ -243,5 +253,6 @@ for(p in 1:20) {
   
   stopCluster(cl) #Stop executing in parallel
   
-  saveRDS(results, paste0(getwd(), "/Analysis_Results/", population, "_Mass_Uni_Results_", p, ".rds"))
+  saveRDS(results, paste0("Analysis_Results_Check/", 
+                          population, "_Mass_Uni_Results_", p, ".rds"))
 }
