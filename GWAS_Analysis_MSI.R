@@ -17,8 +17,8 @@ library(doParallel)
 library(qqman)
 library(rsnps)
 
-dir <- "/panfs/roc/groups/15/petersla/diler001/Genetics/"
-#dir <- "C:/Users/Owner/Google Drive/Genetics_Research/New/"
+#dir <- "/panfs/roc/groups/15/petersla/diler001/Genetics/"
+dir <- "C:/Users/Owner/Google Drive/Genetics_Research/New/"
 
 path <- dir
 
@@ -256,3 +256,102 @@ for(p in 1:nrow(startStop)) {
   saveRDS(results, paste0("Analysis_Results_Check/", 
                           population, "_Mass_Uni_Results_", p, ".rds"))
 }
+
+# Aggregating GWAS Results ------------------------------------------------
+
+readSig <- function(p, population, thresh = 1.01) {
+  temp <- readRDS(paste0("Analysis_Results_Check/", population, 
+                         "_Mass_Uni_Results_", p, ".rds"))
+  
+  # Initialize empty data table
+  combined <- data.table(
+    snp = character(),
+    tVal = numeric(),
+    pVal = numeric(),
+    phenotype = character())
+  
+  for(i in 1:length(temp)) {
+    results <- data.table(snp = names(temp[[i]]$tVal_pVal), 
+                          tVal = unlist(temp[[i]]$tVal_pVal)[seq(1, length(unlist(temp[[i]]$tVal_pVal)), by = 2)], 
+                          pVal = unlist(temp[[i]]$tVal_pVal)[seq(2, length(unlist(temp[[i]]$tVal_pVal)), by = 2)],
+                          phenotype = temp[[i]]$phenotype)
+    combined <- rbindlist(list(combined, results))
+  }
+  print(p)
+  return(combined)
+}
+
+if(file.exists(paste0(population, "_Combined_Results.csv")) == FALSE) {
+Combined_Results <- rbindlist(lapply(FUN = readSig, X = 1:101,
+                                     population = population))
+fwrite(Combined_Results, paste0(population, "_Combined_Results.csv"))
+}
+
+# Creating Manhattan and QQ Plots ------------------------------------------------
+
+# Creating vector of phenotypes
+phenos <- c("Avg_X7mG0", "Avg_X7mG6", "Avg_X6mG0", "Avg_X6mG6", "Avg_r7v6.0", "Avg_r7v6.6", "Avg_IC20",     
+            "Avg_IC50", "Avg_IC80", "Avg_logmut.0", "Avg_logmut.10", "Avg_logmut.20", "Mut10v0", 
+            "Mut20v0", "Mut20v10")
+
+# Preparing genotype data for Manhattan and QQ plots
+if(file.exists(paste0(population, "_ManQQ_Check.csv")) == FALSE) {
+  load("file_names.Rda")
+  
+  file_names <- c(file_names[which(grepl(population, file_names, fixed=TRUE))])
+  
+  URL <- "ftp://ftp.ncbi.nlm.nih.gov/hapmap/genotypes/2010-08_phaseII+III/forward/"
+  
+  URLs = paste0(URL, file_names)
+  
+  Gen_Get <- function(index, urls = URLs, pop)
+  {
+    files <- file_names[which(grepl(pop, file_names, fixed=TRUE))]
+    
+    if(file.exists(substr(x = files[[index]], start=0, stop = (nchar(files[[index]]) - 3))) == FALSE) {
+      download.file(url = urls[[index]], destfile = files[[index]])
+      gunzip(files[[index]], overwrite=TRUE)
+    }
+    
+    fread(substr(x = files[[index]], start=0, stop = (nchar(files[[index]]) - 3)), fill = TRUE)
+  }
+  
+  Gen_Dat <- rbindlist(lapply(FUN = Gen_Get, 
+                              X = 1:length(file_names), pop = population))
+  
+  # Subsetting by columns
+  Gen_Dat <- Gen_Dat[, c("strand", "assembly#", "center",
+                         "protLSID", "assayLSID", "panelLSID", "QCcode") := NULL]
+  
+  fwrite(Gen_Dat, file = paste0(population, "_ManQQ_Check.csv"))
+}
+
+# Reading in GWAS results for specified phenotype
+for(p in phenos) {
+Combined_Results <- fread(paste0(population, "_Combined_Results.csv"))[phenotype == p][, .(SNP = `snp`, P = pVal)]
+
+# Reading in subset of genotype data
+manDat <- fread(paste0(population, "_ManQQ_Check.csv"))[, .(BP = pos, CHR = chrom, SNP = `rs#`)]
+
+# Merging with GWAS results for given phenotype
+manDat <- merge(manDat, Combined_Results, by = "SNP")
+remove(Combined_Results)
+
+# Removes X, Y, and M chromosome data
+manDat$CHR <- manDat$CHR %>% gsub(pattern = "chr", replacement = "") %>% 
+  as.integer()
+manDat <- manDat[complete.cases(manDat), ]
+
+# Creating Manhattan and QQ plots for each outcome
+jpeg(paste0("Plots/New/", population, "_", p, "_Manhat", ".jpeg"))
+manhattan(manDat, main = gsub(p, pattern = "Avg_", replacement = ""))
+dev.off()
+jpeg(paste0("Plots/New/", population, "_", p, "_QQplot", ".jpeg"))
+qq(manDat$P,  main = gsub(p, pattern = "Avg_", replacement = ""))
+dev.off()
+}
+
+# Creating Boxplots -------------------------------------------------------
+
+
+
