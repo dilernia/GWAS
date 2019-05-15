@@ -353,5 +353,88 @@ dev.off()
 
 # Creating Boxplots -------------------------------------------------------
 
+# Loading and organizing phenotype data
 
+phenFiles <- paste0(dir, "Original_Data/", population, "_", 
+                    c("Cyto", "Repair", "IC", "Mut", "Mutation"), "_data.Rda")
+for(f in phenFiles){load(f)}
 
+#Creates list of phenotype data sets
+PhenDats <- lapply(X = paste0(population, "_", 
+                              c("Cyto", "Repair", "IC", "Mut", "Mutation"), "_data"), 
+                   FUN = function(x){eval(parse(text=x))})
+
+#Creating function for cleaning cell line names
+PhenDat_Cleaner <- function(dat) {
+  dat$Cell_line <- dat$Cell_line %>% gsub(pattern = "\\s", replacement = "") %>% toupper()
+  return(dat)
+}
+PhenDats <- lapply(X = PhenDats, FUN = PhenDat_Cleaner)
+
+#Combining all phenotype datasets into one
+PhenData_Combined <- PhenDats %>% 
+  Reduce(function(dtf1,dtf2) full_join(dtf1,dtf2,by="Cell_line"), .) %>% 
+  dplyr::select(-ends_with(".x")) %>% dplyr::select(-ends_with(".y")) %>% 
+  dplyr::select(Cell_line, Ethnicity, Gender, everything())
+
+#Calculating log transformations for IC data, recoding gender variable, log mut diffs
+PhenData_Combined <- PhenData_Combined %>% mutate(Avg_IC20 = log(Avg_IC20), Avg_IC50 = log(Avg_IC50), 
+                                                  Avg_IC80 = log(Avg_IC80), Gender = factor(Gender), 
+                                                  Mut10v0 = log10((Mut10v0+abs(Mut10v0))/2 + 0.01), 
+                                                  Mut20v0 = log10((Mut20v0+abs(Mut20v0))/2 + 0.01),
+                                                  Mut20v10 = log10((Mut20v10+abs(Mut20v10))/2 + 0.01)) %>% 
+  dplyr::select(-c(Mut0, Mut10, Mut20))
+
+# Loading subset of genotype data
+impSnps <- c("rs11258248", "rs3781080", "rs6848554", "rs6823445")
+impGenes <- c("MCM10", "MCM10", "LOC107986236", "LOC107986236")
+boxGen <- fread(paste0(population, "Gen_Dat_Clean_check.csv"), select = c("Cell_line", impSnps))
+
+# Making genotypes a factor
+as.data.frame(boxGen)[, impSnps] <- lapply(as.data.frame(boxGen)[, impSnps],
+                                           FUN = function(x) {temp <- factor(x);
+                                           levels(temp) <- c('aa', 'Aa', 'AA'); return(temp)})
+
+# Merging phenotype and genotype data
+boxData <- PhenData_Combined %>% select(Cell_line, Avg_IC20, Avg_IC50) %>% 
+  left_join(boxGen, by = c("Cell_line" = "Cell_line"))
+
+# Vector of phenotypes to make boxplots for
+phens <- c("Avg_IC20", "Avg_IC50")
+
+for(s in 1:length(impSnps)) {
+for(p in phens) {
+  snpNum <- s
+  pheno <- p
+  
+# Creating box plots
+pLab1 <- gsub(pheno, pattern = "Avg_", replacement = "")
+if(str_detect(pheno, pattern = "IC")) {
+pLab <- paste0("log(", pLab1, ")")
+  } else {
+    pLab <- pLab1
+}
+
+# Recoding from MAF to AA, Aa, aa format
+boxData[, impSnps] <- lapply(boxData[, impSnps], FUN = function(x) {
+                               dplyr::recode(as.character(x), 
+                                             "0" = "AA", "1" = "Aa", "2" = "aa")})
+
+colVec <- c("#009E73", "#0072B2", "#D55E00")
+
+ggData <- boxData %>% select(c(phens, impSnps[snpNum])) %>% 
+  rename("Genotype" = impSnps[snpNum]) %>% filter(!is.na(Genotype)) 
+myGG <- ggData %>% ggplot(aes(x = factor(Genotype), y = get(pheno), 
+                              fill = factor(Genotype))) + 
+  geom_boxplot() + labs(x = "Genotype", y = pLab, 
+   title = paste0(pLab1,
+   " \n SNP: ", impSnps[snpNum], ", Gene: ", impGenes[snpNum])) +
+  scale_fill_manual(values = colVec[which(c("aa", "Aa", "AA") %in% 
+                                    sort(unique(ggData$Genotype)))]) +
+  ylim(0, 5) +
+  theme_bw() + theme(plot.title = element_text(hjust = 0.5),
+                     legend.position = "none")
+ggsave(myGG, device = "pdf",
+       file = paste0("Plots/New/", population, "_", p, "_", impSnps[snpNum], "_box.pdf"))
+}
+}
