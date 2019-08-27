@@ -64,11 +64,12 @@ snpPheno <- sigSNPres %>% filter(pVal <= 5*10^(-8))
 remove("sigSNPres")
 
 # Importing cleaned phenotype data
-dir <- "/home/andrew/andrew.old/Gdrive_Backup/Tobacco_Research/"
+dir <- "/home/adilernia/andrew.old/Gdrive_Backup/Tobacco_Research/"
 phenData <- rbind(readRDS(paste0(dir, "CEU_Pheno_Clean.rds")), 
                   readRDS(paste0(dir, "YRI_Pheno_Clean.rds")))
 colnames(phenData) <- colnames(phenData) %>% gsub(pattern = "Avg_", replacement = "")
-phenData <- phenData[, c("Cell_line", "Ethnicity", "Gender", "turnover", unique(snpPheno$phenotype))]
+phenFull <- phenData
+phenData <- phenData[, c("Cell_line", "Ethnicity", "Gender", unique(snpPheno$phenotype))]
 
 # Importing cleaned genotype data
 if(sum(c(file.exists("sigCEUGenDat.rds"), file.exists("sigYRIGenDat.rds"))) < 2) {
@@ -85,29 +86,107 @@ saveRDS(yriGenDat, "sigYRIGenDat.rds")
 }
 
 fullData <- phenData %>% left_join(readRDS("sigCEUGenDat.rds"), by = c("Cell_line" = "Cell_line")) %>% 
-  left_join(readRDS("sigYRIGenDat.rds"), by = c("Cell_line" = "Cell_line"))
+  left_join(readRDS("sigYRIGenDat.rds"), by = c("Cell_line" = "Cell_line")) %>% as.data.frame()
+fullData[which(!(colnames(fullData) %in% c("Cell_line", "Ethnicity", "Gender")))] <- sapply(fullData[which(!(colnames(fullData) %in% c("Cell_line", "Ethnicity", "Gender")))], 
+                                                                                            FUN = function(x) {as.numeric(as.character(x))})
 
 popPhen <- snpPheno[!duplicated(snpPheno[, c("pop", "phenotype")]), c("pop", "phenotype")]
 
-p <- 1
+# Reobtaining results for my own sanity
+resRerun <- function(x) {
+pop <- popPhen[x, "pop"]
+pheno <- popPhen[x, "phenotype"]
+snps <- snpPheno[which(snpPheno$phenotype == pheno & snpPheno$pop == pop), "snp"]
+
+MLR <- function(gendCol, snpCol, phenCol) {
+  temp <- data.frame(g = gendCol, s = snpCol)
+    fit <- lm(phenCol ~ gendCol + snpCol)
+      tStat <- summary(fit)$coefficients[3,3]
+      pval <- summary(fit)$coefficients[3,4]
+      return(c(tStat, pval))
+}
+
+results <- data.frame(snp = character(), tVal = numeric(), pVal = numeric(), 
+                      phenotype = character(), pop = character(), stringsAsFactors = FALSE)
+
+for(i in 1:length(snps)) {
+tpVals <- MLR(gendCol = fullData[which(fullData$Ethnicity == pop), "Gender"],
+    phenCol = fullData[which(fullData$Ethnicity == pop), pheno],
+    snpCol = fullData[which(fullData$Ethnicity == pop), snps[i]])
+results[i, ] <- c(snps[i], tpVals[1], tpVals[2], pheno, pop)
+}
+
+return(results)
+}
+
+testRes <- map_dfr(.x = 1:nrow(popPhen), .f = resRerun) 
+
+# Function for imputing phenotype values with mean
+impute <- function(missCol = "IC80", datf = fullData) {
+  impVal <- mean(datf[, missCol], na.rm = TRUE)
+  datf[which(is.na(datf[, missCol])), missCol] <- impVal
+  return(datf[, missCol])
+}
+
+impIC80 <- impute(missCol = "IC80", datf = fullData)
+implogmut.20 <- impute(missCol = "logmut.20", datf = fullData)
+
+# Function for imputing phenotype values using sample proportions
+imputeSNP <- function(missCol = "rs7136711", datf) {
+  res <- table(datf[, missCol]) %>% as.data.frame() %>% mutate(Prob = Freq / sum(Freq))
+  res <- lapply(res, FUN = function(x){as.numeric(as.character(x))})
+  datf[is.na(datf[, missCol]), missCol] <- sample(res$Var1, size = sum(is.na(datf[, missCol])), replace = TRUE, prob = res$Prob)
+  datf[, missCol]
+}
+
+yriSigSnps <- unique(snpPheno[which(snpPheno$pop == "YRI"), "snp"])
+impYRIsnps <- lapply(X = 1:length(yriSigSnps), FUN = function(x) {imputeSNP(missCol = yriSigSnps[x], 
+                                               datf = fullData[which(fullData$Ethnicity == "YRI"), yriSigSnps])}) %>% 
+  as.data.frame()
+colnames(impYRIsnps) <- yriSigSnps
+
+ceuSigSnps <- unique(snpPheno[which(snpPheno$pop == "CEU"), "snp"])
+impCEUsnps <- lapply(X = 1:length(ceuSigSnps), FUN = function(x) {imputeSNP(missCol = ceuSigSnps[x], 
+                                               datf = fullData[which(fullData$Ethnicity == "CEU"), ceuSigSnps])}) %>% as.data.frame()
+colnames(impCEUsnps) <- ceuSigSnps
+
+# Random imputation based on sample proportions
+imputeR2 <- function(seed) {
+  
+  set.seed(seed)
+
+# Imputing genotype values using proportions estimated using modleing above
+impData <- fullData
+impData[, c("IC80", "logmut.20")] <- cbind(impIC80, implogmut.20)
+impData[which(impData$Ethnicity == "CEU"), ceuSigSnps] <- impCEUsnps
+impData[which(impData$Ethnicity == "YRI"), yriSigSnps] <- impYRIsnps
 
 # Function for summarize R^2 for each set of significant SNPs
 rSqrSummary <- function(p) {
 pop <- popPhen[p, "pop"]
 pheno <- popPhen[p, "phenotype"]
-sigSnps <- snpPheno[which(snpPheno$pop == pop & snpPheno$phenotype == pheno), "snp"][1]
-phenSub <- fullData[which(fullData$Ethnicity == pop), c(pheno, "Gender", "turnover", sigSnps)]
+sigSnps <- snpPheno[which(snpPheno$pop == pop & snpPheno$phenotype == pheno), "snp"]
+phenSub <- impData[which(impData$Ethnicity == pop), c(pheno, "Gender", sigSnps)]
+if(length(sigSnps) == 1) {
 phenSub[, sigSnps] <- as.numeric(phenSub[, sigSnps])
+} else {
+  phenSub[, sigSnps] <- lapply(phenSub[, sigSnps], FUN = as.numeric)
+}
 
-fit <- lm(paste(pheno, " ~ Gender + turnover"), data = phenSub[complete.cases(phenSub), ])
-fitSNPs <- lm(paste(pheno, " ~ ."), data = phenSub[complete.cases(phenSub), ])
+fit <- lm(paste(pheno, " ~ Gender"), data = phenSub)
+fitSNPs <- lm(paste(pheno, " ~ ."), data = phenSub)
 return(data.frame(Population = pop, Phenotype = pheno, SNPs = paste(sigSnps, collapse = ", "), 
-           R2 = round(summary(fitSNPs)$r.squared - summary(fit)$r.squared, 4),
-           R2_Gend_Turn = round(summary(fit)$r.squared, 4), 
-           All_SNPs = paste(snpPheno[which(snpPheno$pop == pop & snpPheno$phenotype == pheno), "snp"], collapse = ", ")))
+           R2_SNPs = round(summary(fitSNPs)$r.squared - summary(fit)$r.squared, 4),
+           R2_Gend = round(summary(fit)$r.squared, 4),
+           R2_Full = round(summary(fitSNPs)$r.squared, 4)))
 }
 
 aggRes <- map_dfr(.f = rSqrSummary, .x = 1:nrow(popPhen))
+return(aggRes)
+}
+
+r2Res <- map_dfr(.f = imputeR2, .x = 1:100) %>% group_by(Population, Phenotype, SNPs) %>% 
+  summarize(R2_SNPs = mean(R2_SNPs), R2_Gend = mean(R2_Gend), R2_Full = mean(R2_Full))
 
 # Gene specific summaries -------------------------------------------------
 
@@ -249,3 +328,42 @@ for(p in outcomes) {
 #colnames(CEU_Gen_Dat)
 #"rs#"       "alleles"   "chrom"     "pos"       "strand"    "assembly#" "center"   
 # "protLSID"  "assayLSID" "panelLSID" "QCcode"    "NA06984"   "NA06985"
+
+# Creating Dot Plots ------------------------------------------------------
+
+phenVar <- "IC50raw"
+phenLabs <- list(`r7v6.6` = bquote('7-mG/'*~O^6*'-mG at 6 h'),
+                 IC50 = bquote(~IC[50]*" ("*mu*"M NMUr)"))
+
+# Transforming IC measures back to original units
+phenFull <- phenFull %>% mutate(IC20raw = exp(IC20), IC50raw = exp(IC50), IC80raw = exp(IC80))
+
+meanData <- phenFull %>% group_by(Ethnicity) %>% summarize(Mean = mean(get(phenVar)))
+
+phenFull %>% ggplot(aes(x = get(phenVar), fill = Ethnicity)) + geom_dotplot(stackdir = "center") +
+  facet_grid(rows = vars(Ethnicity)) + theme_bw() + theme(legend.position = "none") + 
+  scale_y_continuous(NULL, breaks = NULL) + scale_fill_manual(values=c("royalblue1", "green4")) +
+  labs(x = bquote(~IC[50]*" ("*mu*"M NMUr)")) + 
+  geom_vline(data = meanData, aes(xintercept = Mean), linetype = "dashed")
+
+ggsave(paste0("dotPlot_", phenVar, ".png"), device = "png",
+       width = 77*2, height = 51.5*2, units = "mm")
+
+# Effect of Age or Gender -------------------------------------------------
+
+gRes <- map_dfr(.x = colnames(phenFull)[which(!(colnames(phenFull) %in% c("Cell_line", "Ethnicity", "Gender")))], 
+        .f = function(phen){
+fit <- lm(get(phen) ~ Gender, data = phenFull)
+res <- broom::tidy(fit)[2, ]
+res$term <- phen
+return(res)
+})
+
+gRes <- gRes %>% filter(!(term %in% c("IC20raw", "IC50raw", "IC80raw", "turnover"))) %>% 
+  rename(Phenotype = term, Effect = estimate, SE = std.error) %>% 
+  select(Phenotype, Effect, SE, `p.value`) %>% mutate(Phenotype = gsub(gsub(gsub(Phenotype, pattern = "IC20", replacement = "log.IC20"),
+                                                  pattern = "IC50", replacement = "log.IC50"),
+                                                  pattern = "IC80", replacement = "log.IC80"))
+
+# Saving to csv
+write.csv(gRes, "genderEffect.csv")
